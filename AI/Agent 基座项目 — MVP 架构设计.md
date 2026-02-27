@@ -1,0 +1,1208 @@
+Agent 基座项目 — MVP 架构设计
+一、项目定位
+1.1 核心定位
+这不是一个多租户的 SaaS 平台，而是一个各业务线单独部署的、单用户的 Agent 基座项目。
+
+                    不是这样的
+┌──────────────────────────────────────────┐
+│          统一 SaaS 平台（多租户）            │
+│                                          │
+│  业务线A ─┐                               │
+│  业务线B ─┤─── 共享一个平台实例              │
+│  业务线C ─┘                               │
+└──────────────────────────────────────────┘
+
+                    而是这样的
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│  部署实例 A    │  │  部署实例 B    │  │  部署实例 C    │
+│              │  │              │  │              │
+│  业务线A      │  │  业务线B      │  │  业务线C      │
+│  独立运行      │  │  独立运行      │  │  独立运行      │
+│              │  │              │  │              │
+│  自己的配置    │  │  自己的配置    │  │  自己的配置    │
+│  自己的数据    │  │  自己的数据    │  │  自己的数据    │
+└──────────────┘  └──────────────┘  └──────────────┘
+
+每个业务线拿到同一份基座代码，写自己的配置文件（MD），独立部署，独立运行。
+1.2 核心思想
+●定义与编排分离：Agent 的定义（是什么）和编排（怎么组合）是两个独立的概念。同一个 Agent 可以在不同场景中扮演不同角色（主/从），通过 Scene 配置灵活组合
+●配置驱动：所有业务配置通过 MD/YAML 文件完成，框架解析配置文件构建运行时实例
+●多 Agent 协调：支持 MainAgent 协调多个 SubAgent 的能力，编排关系由 Scene 配置决定
+●自我进化：记忆的进化（越用越懂用户）、Skills 的进化（越用越会做事）
+●独立会话并发：调用同一个 Agent 时，是多个实例、多个独立会话，要求并发
+1.2.1 定义与编排分离（核心原则）
+Agent 本身没有"主/从"的固有属性，它只是一个能力单元。主从关系由编排配置（Scene）决定：
+
+传统思路（耦合）：                    我们的思路（解耦）：
+┌─────────────────────┐              ┌─────────────────────┐
+│  agent.md           │              │  agent.md           │
+│                     │              │                     │
+│  name: "财务助手"    │              │  name: "财务助手"    │
+│  type: sub  ←────── │ 写死了角色    │  model: deepseek    │
+│  tools: [...]       │              │  prompt: ...        │
+│  skills: [...]      │              │                     │
+│  subagents: [...]   │              │  （只有定义，没有绑定）│
+└─────────────────────┘              └─────────────────────┘
+                                              ↓
+                                     ┌─────────────────────┐
+                                     │  scene.yaml         │
+                                     │                     │
+                                     │  main_agent: A      │
+                                     │  sub_agents: [B, C] │
+                                     │  tool_bindings: ... │
+                                     │  skill_bindings: ...│
+                                     │                     │
+                                     │  （编排关系在这里定义）│
+                                     └─────────────────────┘
+
+好处：
+●同一个 Agent（如"财务助手"）可以在场景 X 中作为 SubAgent，在场景 Y 中作为 MainAgent
+●Tools/Skills 的绑定可以按场景灵活调整，不需要修改 Agent 定义
+●新增场景只需新建 Scene 配置，无需改动已有 Agent
+1.3 技术选型（已确定）
+领域	选型	说明
+Agent 开发框架	LangChain	Agent 编排与执行
+知识库	RAGFlow	知识检索与管理
+记忆系统	PowerMem	四路混合检索、艾宾浩斯衰减、中文友好
+Web 框架	FastAPI	WebSocket + HTTP API
+1.4 两种架构方案
+基于"定义与编排分离"原则，我们有两种可选的架构方案：
+方案 A：纯文件方案（MVP 推荐）
+
+┌─────────────────────────────────────────────────────────────────┐
+│                        纯文件架构                                 │
+│                                                                  │
+│   config/                          内存缓存                       │
+│   ├── agents/                      ┌──────────────────┐          │
+│   │   ├── financial.md      ──────→│  AgentRegistry   │          │
+│   │   ├── project.md               │  SkillRegistry   │          │
+│   │   └── asset.md                 │  MCPSchemaCache  │          │
+│   ├── skills/                      └────────┬─────────┘          │
+│   │   ├── diagnosis.md                      │                    │
+│   │   └── report.md                         ▼                    │
+│   ├── scenes/                      ┌──────────────────┐          │
+│   │   ├── bi_analysis.yaml  ──────→│  SceneRegistry   │          │
+│   │   └── quick_query.yaml         └────────┬─────────┘          │
+│   └── mcp_servers.yaml                      │                    │
+│                                             ▼                    │
+│                                    ┌──────────────────┐          │
+│                                    │  Agent Runtime   │          │
+│                                    │  (请求时组装)      │          │
+│                                    └──────────────────┘          │
+│                                                                  │
+│   热更新：POST /api/reload                                        │
+└─────────────────────────────────────────────────────────────────┘
+
+特点：
+●配置文件直接放在 Docker Volume 挂载目录
+●启动时扫描文件 → 解析 → 缓存到内存
+●热更新通过 /api/reload API 触发重新加载
+●无数据库依赖，部署简单
+方案 B：Page + 数据库方案（后续演进）
+
+┌─────────────────────────────────────────────────────────────────┐
+│                      Page + 数据库架构                            │
+│                                                                  │
+│   ┌──────────────┐         ┌──────────────┐                     │
+│   │  管理页面      │ ──────→ │   数据库      │                     │
+│   │              │  CRUD   │              │                     │
+│   │  · Agent管理  │         │  · agents    │                     │
+│   │  · Skill管理  │         │  · skills    │                     │
+│   │  · Scene编排  │         │  · scenes    │                     │
+│   │  · MCP配置   │         │  · bindings  │                     │
+│   └──────────────┘         └──────┬───────┘                     │
+│                                   │                              │
+│                                   ▼                              │
+│                          ┌──────────────────┐                   │
+│                          │  Agent Runtime   │                   │
+│                          │  (从DB加载配置)    │                   │
+│                          └──────────────────┘                   │
+│                                                                  │
+│   热更新：DB 修改后下次请求自动生效                                  │
+└─────────────────────────────────────────────────────────────────┘
+
+特点：
+●管理页面提供可视化配置
+●配置持久化到数据库
+●修改即时生效，无需重启
+●支持版本管理、权限控制等高级功能
+方案对比
+维度	纯文件方案	Page + 数据库方案
+部署复杂度	低（无 DB）	中（需要 DB）
+配置方式	编辑 MD/YAML 文件	Web UI 操作
+热更新	POST /api/reload	自动生效
+版本管理	Git 管理文件	DB 版本表
+适用阶段	MVP / 开发调试	生产 / 多人协作
+演进路径	可平滑升级到 B	-
+MVP 阶段选择方案 A，后续根据需要演进到方案 B。两种方案的核心模型（Agent 定义、Scene 编排）保持一致，只是存储和管理方式不同。
+
+1.5 与一期（现状）的对比
+维度	一期架构（现状）	MVP 基座（目标）
+Agent 定义	Python 代码 agent.py 硬编码	agent.md 声明式配置
+Agent 编排	代码写死 sub_agents 列表	scene.yaml 独立编排
+Prompt	代码字符串常量	MD 文件，框架解析
+Tool	@tool 装饰器在进程内	内置工具库 + 业务线 MCP Server
+Tool 绑定	代码中 get_tools() 硬编码	scene.yaml 中 tool_bindings 配置
+LLM 配置	全局 .env	每个 Agent 在 MD 中独立配置
+记忆	无	PowerMem 记忆系统
+知识库	无（每次实时查）	RAGFlow + MD 内联知识
+Skill	无	MD 语义注册 + 脚本/工具双模式
+并发	单会话	多实例独立会话并发
+
+二、整体架构
+2.1 架构分层
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                        三方业务系统 / 调试页面                         │
+│                      (WebSocket / HTTP 接入)                        │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+┌──────────────────────────────▼──────────────────────────────────────┐
+│                          接入层 (FastAPI)                            │
+│                                                                     │
+│   · WebSocket 长连接          · HTTP API                            │
+│   · 认证鉴权（X-User-Token）   · 连接/会话管理                        │
+│   · 流式消息推送               · 请求路由                             │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+┌──────────────────────────────▼──────────────────────────────────────┐
+│                       Agent 执行引擎 (Runtime)                       │
+│                                                                     │
+│   ┌─────────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
+│   │  配置解析器        │  │ Agent 组装器  │  │ Sync-Orchestrator    │  │
+│   │                  │  │              │  │ (同步调度代理)          │  │
+│   │ · 解析 agent.md  │  │ · 基于 Scene │  │                      │  │
+│   │ · 解析 scene.yaml│  │   动态组装    │  │ · 主Agent阻塞等待     │  │
+│   │ · 构建 Registry  │  │   LangChain  │  │ · 子Agent独立上下文    │  │
+│   └─────────────────┘  │   Agent      │  └──────────────────────┘  │
+│                        └──────────────┘                             │
+│                                                                     │
+│   ┌─────────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
+│   │  Skill 引擎       │  │ 记忆引擎      │  │ Context Assembly     │  │
+│   │                  │  │ (PowerMem)   │  │ (上下文组装)           │  │
+│   │ · MD语义注册      │  │              │  │                      │  │
+│   │ · 脚本沙箱执行     │  │ · 短期记忆    │  │ · Prompt渲染          │  │
+│   │ · 工具模式        │  │ · 长期记忆    │  │ · 记忆注入             │  │
+│   └─────────────────┘  │ · 主从隔离    │  │ · 知识注入             │  │
+│                        └──────────────┘  │ · Skill索引注入        │  │
+│                                          └──────────────────────┘  │
+└───────┬──────────────────┬──────────────────┬──────────────────────┘
+        │                  │                  │
+        ▼                  ▼                  ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────────┐
+│ 内置工具库     │  │ MCP Client   │  │ LLM 层            │
+│              │  │ Hub          │  │                  │
+│ · createagent│  │              │  │ · 模型调用         │
+│ · cron       │  │ · 连接业务线   │  │ · 流式输出         │
+│ · file_reader│  │   MCP Server │  │                  │
+│ · time       │  │ · 认证透传     │  │                  │
+└──────────────┘  │ · Schema缓存  │  └──────────────────┘
+                  └──────┬───────┘
+                         │ MCP 协议 (Streamable HTTP)
+                         ▼
+                  ┌──────────────┐
+                  │ 业务线        │
+                  │ MCP Server   │
+                  │ (独立部署)     │
+                  └──────────────┘
+
+2.2 一次对话的完整请求链路
+
+三方系统发送消息（携带 user_id + token）
+    │
+    ▼
+┌─ 接入层 ──────────────────────────────────────────────────────────┐
+│  1. WebSocket / HTTP 接收消息                                      │
+│  2. 认证鉴权 → 解析用户身份 (user_id)                                │
+│  3. 路由到目标 Agent                                               │
+└────────────────────────────────┬──────────────────────────────────┘
+                                 │
+                                 ▼
+┌─ 会话管理 ────────────────────────────────────────────────────────┐
+│  4. 查找/创建 session（user_id + agent_type → session）            │
+│  5. 加载历史消息（Session 级短期记忆）                                │
+│  6. 检查是否需要上下文压缩（历史过长 → 压缩）                          │
+│  7. 加载用户画像（会话启动时即调用）                                   │
+└────────────────────────────────┬──────────────────────────────────┘
+                                 │
+                                 ▼
+┌─ Agent 执行引擎 ──────────────────────────────────────────────────┐
+│  8. 加载 Scene 配置，确定 Agent 编排关系                                  │
+│  9. 动态组装 LangChain Agent：                                     │
+│     · 从 Registry 获取 Agent 定义                                   │
+│     · 从 Scene 获取 工具/技能 绑定关系                                │
+│     · MainAgent + SubAgent 层级组装                                 │
+│     · 每个 Agent 绑定：Prompt + Tools + Skills + LLM Config        │
+│                                                                   │
+│  10. Context Assembly（上下文组装）：                                 │
+│     ┌──────────────────────────────────────────────┐              │
+│     │  System Prompt =                             │              │
+│     │      角色定义（agent.md 中的 system_prompt）    │              │
+│     │    + Skill 描述索引（活跃 Skill 注入）          │              │
+│     │    + 工具清单（内置 + MCP 工具摘要）            │              │
+│     │    + 记忆召回（PowerMem 检索结果）             │              │
+│     │    + 知识注入（agent.md 中配置的 MD 知识）      │              │
+│     │    + 用户画像（启动会话时已加载）               │              │
+│     │    + 运行时信息（时间/会话元数据）              │              │
+│     └──────────────────────────────────────────────┘              │
+│                                                                   │
+│  11. ReAct Loop 执行：                                             │
+│      ┌──────────────────────────────────────────┐                 │
+│      │   LLM 推理 ──→ 需要调工具？──→ 否 ──→ 输出  │                 │
+│      │      ▲              │                     │                 │
+│      │      │             是                     │                 │
+│      │      │              ▼                     │                 │
+│      │      │      内置工具 / MCP Client Hub     │                 │
+│      │      │              │                     │                 │
+│      │      └────── 结果回传 ─┘                   │                 │
+│      └──────────────────────────────────────────┘                 │
+│                                                                   │
+│  12. 需要子Agent？ → Sync-Orchestrator 阻塞等待子Agent完成           │
+│  13. 流式输出：token 逐个推送                                        │
+└────────────────────────────────┬──────────────────────────────────┘
+                                 │
+                                 ▼
+┌─ 后处理 ──────────────────────────────────────────────────────────┐
+│  14. 流式推送给客户端（WebSocket stream 事件）                        │
+│  15. 记忆引擎异步提取本轮对话记忆（PowerMem）                          │
+│  16. 会话状态持久化                                                  │
+└────────────────────────────────────────────────────────────────────┘
+
+
+三、配置规范
+基于"定义与编排分离"原则，配置分为三类文件：
+文件类型	职责	示例
+agent.md	Agent 定义（是什么）	名称、模型、Prompt
+skill.md	Skill 定义（能做什么）	名称、描述、执行指令
+scene.yaml	编排配置（怎么组合）	主从关系、工具绑定、技能绑定
+3.1 agent.md — Agent 定义
+agent.md 只定义 Agent 本身的属性，不包含工具、技能、子 Agent 的绑定（这些在 scene.yaml 中配置）
+--- # ====== 基础信息 ====== name: "财务管理助手" description: "负责财务数据分析，包括利润、预算、发票等维度"  # ====== 模型配置 ====== model: "deepseek-chat" temperature: 0.3 max_tokens: 4096 timeout: 120  # ====== 记忆配置（可选，有默认值） ====== memory:   session_compression: true      # 启用上下文压缩   long_term: true                # 启用长期记忆   user_profile: true             # 启用用户画像 ---  # 系统提示词  你是{name}，专注于企业财务数据的分析和解读。  ## 你的能力范围 - 项目利润分析（利润、收入、成本、毛利率） - 预算执行情况（预算完成率、超支预警） - 发票税额查询与分析  ## 工作原则 - 数据精确，不估算不猜测 - 发现异常时主动标注 - 环比/同比对比时标注变化幅度  ## 当前用户信息 用户ID: {user_id} 注意：没有 tools、skills、subagents 字段 — 这些绑定关系在 scene.yaml 中定义。
+3.2 skill.md — Skill 定义
+--- # ====== 头部（始终加载，注入系统提示作为索引） ====== name: "项目健康诊断" description: "对指定项目进行全方位健康诊断分析"  # ====== 调用控制 ====== mode: tool                           # tool | script user_invocable: true                 # 用户可否手动 /项目诊断 触发 model_invocable: true                # LLM 可否自动触发 schedule: null                       # cron 表达式（非空时启用定时触发） argument_hint: "<项目ID>"  # ====== 依赖声明（用于运行时校验） ====== requires:   tools: [get_project_profit, get_operation_data] ---  # 执行指令（仅触发时加载）  你正在执行【项目健康诊断】任务。  ## 执行步骤 1. 调用 get_project_profit 获取项目财务数据 2. 调用 get_operation_data 获取运营数据 3. 综合分析，输出健康评分和关键发现  ## 输出格式 ...  ## 约束 - $ARGUMENTS 为项目ID，如果未提供则询问用户 3.3 scene.yaml — 编排配置
+Scene 是编排的核心，定义了 Agent 之间的主从关系、工具绑定、技能绑定：
+
+# config/scenes/bi_analysis.yaml
+
+name: "BI 分析场景"
+description: "企业级财务与运营分析，支持多维度数据查询"
+
+# ====== Agent 编排 ======
+main_agent: bi_master                    # 主 Agent（引用 agents/bi_master.md）
+
+sub_agents:                              # 子 Agent 列表
+  - financial_manager                    # 引用 agents/financial_manager.md
+  - project_manager                      # 引用 agents/project_manager.md
+  - asset_manager                        # 引用 agents/asset_manager.md
+
+# ====== 工具绑定 ======
+tool_bindings:
+  # 主 Agent 的工具
+  bi_master:
+    builtin: [time_provider, file_reader]
+
+  # 子 Agent 的工具（引用 mcp_servers.yaml 中定义的 MCP Server）
+  financial_manager:
+    mcp_servers:
+      - server: financial-srv
+        tools: [get_project_profit, get_budget_status, get_invoice_tax]
+
+  project_manager:
+    mcp_servers:
+      - server: project-srv
+        tools: [get_project_list, get_project_detail, get_project_progress]
+
+# ====== 技能绑定 ======
+skill_bindings:
+  bi_master:
+    - project_diagnosis                  # 引用 skills/project_diagnosis.md
+    - anomaly_scan
+    - monthly_report
+
+  financial_manager:
+    - budget_analysis
+    - profit_trend
+
+# ====== 知识绑定（可选） ======
+knowledge_bindings:
+  bi_master:
+    - path: "./knowledge/business_rules.md"
+    - path: "./knowledge/faq.md"
+
+3.4 mcp_servers.yaml — MCP Server 注册
+集中管理所有 MCP Server 的连接信息：
+
+# config/mcp_servers.yaml
+
+servers:
+  financial-srv:
+    url: "http://financial-mcp:9001/mcp"
+    auth_mode: header_passthrough        # 透传用户 token
+    description: "财务数据服务"
+
+  project-srv:
+    url: "http://project-mcp:9002/mcp"
+    auth_mode: header_passthrough
+    description: "项目管理服务"
+
+  asset-srv:
+    url: "http://asset-mcp:9003/mcp"
+    auth_mode: header_passthrough
+    description: "资产管理服务"
+
+3.5 目录结构
+
+project_root/
+├── config/                              # 配置目录（Docker Volume 挂载）
+│   ├── agents/                          # Agent 定义
+│   │   ├── bi_master.md
+│   │   ├── financial_manager.md
+│   │   ├── project_manager.md
+│   │   └── asset_manager.md
+│   ├── skills/                          # Skill 定义
+│   │   ├── project_diagnosis.md
+│   │   ├── anomaly_scan.md
+│   │   ├── budget_analysis.md
+│   │   └── monthly_report.md
+│   ├── scenes/                          # 场景编排
+│   │   ├── bi_analysis.yaml             # BI 分析场景
+│   │   └── quick_query.yaml             # 快速查询场景
+│   ├── knowledge/                       # 知识文件
+│   │   ├── business_rules.md
+│   │   └── faq.md
+│   └── mcp_servers.yaml                 # MCP Server 注册
+├── backend/                             # 框架代码
+│   └── app/
+│       └── ...
+├── .env                                 # 环境变量
+└── requirements.txt
+
+3.6 灵活编排示例
+同一组 Agent 可以在不同场景中有不同的编排：
+
+# 场景 1：BI 分析（财务助手作为 SubAgent）
+# config/scenes/bi_analysis.yaml
+main_agent: bi_master
+sub_agents: [financial_manager, project_manager]
+
+# 场景 2：财务专项（财务助手作为 MainAgent）
+# config/scenes/financial_focus.yaml
+main_agent: financial_manager            # 同一个 Agent，这里是主角色
+sub_agents: [budget_analyst]             # 可以有自己的子 Agent
+
+# 场景 3：快速查询（单 Agent，无子 Agent）
+# config/scenes/quick_query.yaml
+main_agent: quick_assistant
+sub_agents: []                           # 无子 Agent
+
+
+四、模块设计
+4.1 Agent 模块
+4.1.1 Agent 类型
+Agent 本身不具有固有的"主/从"属性，类型由 Scene 编排决定：
+角色	职责	由谁决定
+MainAgent	协调型，理解用户意图并分派给合适的 SubAgent	scene.yaml 中的 main_agent 字段
+SubAgent	执行型，专注于某个业务领域的具体任务	scene.yaml 中的 sub_agents 列表
+同一个 Agent 在不同场景中可以扮演不同角色。
+4.1.2 Agent 组装过程（基于 Scene）
+
+用户请求到达（指定 scene_id 或使用默认场景）
+    │
+    ▼
+加载 Scene 配置（scene.yaml）
+    │
+    ├── main_agent: bi_master
+    │   │
+    │   ├── 加载 agents/bi_master.md → 解析 Prompt + 模型配置
+    │   ├── 加载 tool_bindings.bi_master → 绑定内置工具
+    │   ├── 加载 skill_bindings.bi_master → 构建 Skill 索引
+    │   └── 加载 knowledge_bindings → 注入知识内容
+    │
+    ├── sub_agents: [financial_manager, project_manager]
+    │   │
+    │   ├── financial_manager:
+    │   │   ├── 加载 agents/financial_manager.md → 解析 Prompt + 模型配置
+    │   │   ├── 加载 tool_bindings.financial_manager → 绑定 MCP 工具
+    │   │   ├── 加载 skill_bindings.financial_manager → 构建 Skill 索引
+    │   │   └── → 组装为 LangChain Agent → 包装为 Tool（供 MainAgent 调用）
+    │   │
+    │   └── project_manager:
+    │       └── ...同上
+    │
+    └── → 最终组装为完整的 LangChain Agent
+          MainAgent(tools=[内置工具, financial_manager, project_manager, ...])
+
+4.1.3 并发模型
+
+同一个 Agent 配置，可以同时服务多个用户：
+
+用户A ──→ Agent 实例 1 (session_A)  ─── 独立会话、独立上下文
+用户B ──→ Agent 实例 2 (session_B)  ─── 独立会话、独立上下文
+用户C ──→ Agent 实例 3 (session_C)  ─── 独立会话、独立上下文
+
+每个实例：
+  · 共享同一份 agent.md 配置（只读）
+  · 共享同一份 LLM 连接（连接池）
+  · 独立的 session 上下文
+  · 独立的短期记忆
+  · 共享长期记忆库（按 user_id 隔离）
+
+
+4.2 Agent 调度：Sync-Orchestrator（同步调度代理）
+4.2.1 核心机制
+当主 Agent 触发子 Agent 或 Skill 时，框架挂起主进程，进入同步阻塞等待，直到子任务完成后才继续。
+
+MainAgent 处理用户请求
+    │
+    │ 判断需要调用 SubAgent: "财务管理助手"
+    │
+    ▼
+┌─ Sync-Orchestrator ────────────────────────────────────────────┐
+│                                                                 │
+│  1. 挂起 MainAgent 执行                                          │
+│                                                                 │
+│  2. 创建 SubAgent 上下文沙箱                                      │
+│     · 干净的上下文，不包含 MainAgent 历史                           │
+│     · 仅接收 MainAgent 通过"显式参数"传递的信息                     │
+│     · 参数示例：task="分析宝龙广场项目利润情况", project_id="P1001"  │
+│                                                                 │
+│  3. SubAgent 独立执行                                             │
+│     · 使用自己的 system_prompt + tools + llm_config               │
+│     · 可以多轮工具调用                                             │
+│     · 有自己独立的 ReAct Loop                                     │
+│                                                                 │
+│  4. SubAgent 执行完毕，返回结果                                     │
+│                                                                 │
+│  5. 恢复 MainAgent 执行，将 SubAgent 结果注入上下文                  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+MainAgent 拿到结果，继续推理或输出
+
+4.2.2 主从隔离记忆
+子 Agent 启动时拥有干净的上下文沙箱，主 Agent 的历史记录仅通过"显式参数"传递，确保子任务处理不受干扰。
+
+MainAgent 上下文                     SubAgent 上下文
+┌──────────────────────┐            ┌──────────────────────┐
+│ 完整的对话历史          │            │ 干净的沙箱              │
+│ · 用户消息1            │            │                      │
+│ · Agent回复1          │  显式参数    │ · SubAgent system    │
+│ · 用户消息2            │ ─────────→ │   prompt             │
+│ · 工具调用记录          │  (仅传递    │ · 任务描述（来自参数）    │
+│ · ...                 │   必要信息)  │ · 工具调用和结果         │
+│                       │            │                      │
+│ 不会传递给SubAgent ──── │ ╳          │ 不包含主Agent历史 ────  │
+└──────────────────────┘            └──────────────────────┘
+
+
+4.3 记忆模块
+4.3.1 记忆层次
+
+┌─────────────────────────────────────────────────────────────────┐
+│                         记忆系统全景                               │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │  Session 级短期记忆                                          │  │
+│  │                                                             │  │
+│  │  · 用户-会话-Agent 三方关系绑定                                │  │
+│  │  · 当前会话的完整对话历史                                      │  │
+│  │  · 上下文压缩逻辑（对话过长时 LLM 总结压缩）                    │  │
+│  │  · 会话结束后持久化                                           │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │  长期记忆 (PowerMem)                                        │  │
+│  │                                                             │  │
+│  │  · 一个会话的完整记忆沉淀                                      │  │
+│  │  · 四路混合检索（向量 + BM25 + 关键词 + 时间）                  │  │
+│  │  · 艾宾浩斯遗忘曲线衰减                                       │  │
+│  │  · 中文 jieba 分词友好                                        │  │
+│  │  · 按 user_id 隔离                                           │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │  主从隔离记忆                                                 │  │
+│  │                                                             │  │
+│  │  · 子 Agent 启动时拥有干净的上下文沙箱                          │  │
+│  │  · 主 Agent 历史仅通过"显式参数"传递                            │  │
+│  │  · 确保子任务处理不受主对话上下文干扰                             │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │  用户画像                                                    │  │
+│  │                                                             │  │
+│  │  · 三方用户唯一 ID 标识                                       │  │
+│  │  · 启动会话时就要调用加载                                      │  │
+│  │  · 用户偏好、关注项目、分析习惯等                                │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+
+4.3.2 用户-会话-Agent 关系
+
+三方用户 (唯一用户ID)
+    │
+    ├── 会话 1 ── Agent 实例 A（MainAgent）
+    │              ├── Session 短期记忆（本次对话历史）
+    │              └── SubAgent 实例（沙箱，无主Agent历史）
+    │
+    ├── 会话 2 ── Agent 实例 B（同一Agent配置，新实例）
+    │              └── Session 短期记忆（本次对话历史）
+    │
+    └── 长期记忆（PowerMem，跨会话共享，按 user_id 隔离）
+
+4.3.3 记忆调用时序
+
+会话启动
+    │
+    ├── 1. 加载用户画像（user_id → PowerMem 查询）
+    ├── 2. 加载 Session 短期记忆（session_id → 历史消息）
+    ├── 3. 检查是否需要上下文压缩
+    │
+    ▼
+对话进行中
+    │
+    ├── 4. 每轮对话：记忆自动检索（PowerMem 被动注入相关记忆）
+    ├── 5. Agent 可主动搜索记忆（工具调用）
+    │
+    ▼
+对话结束
+    │
+    ├── 6. Session 短期记忆持久化
+    ├── 7. 异步提取长期记忆（PowerMem 存储）
+    └── 8. 用户画像更新（如有新偏好）
+
+4.3.4 上下文压缩
+当 Session 短期记忆（对话历史）过长时，触发上下文压缩：
+
+原始历史消息（token > 阈值）
+    │
+    ▼
+LLM 总结压缩
+    │
+    ├── 保留最近 N 轮完整消息
+    ├── 更早的消息 → LLM 生成摘要
+    └── 摘要 + 最近消息 = 压缩后的上下文
+    │
+    ▼
+压缩后的上下文继续用于后续对话
+
+4.3.5 记忆进化（自我进化能力之一）
+记忆的进化是指系统越用越懂用户：
+
+初始状态               使用一段时间后              长期使用后
+┌──────────┐          ┌──────────────┐          ┌──────────────────┐
+│ 用户画像：空 │          │ 用户画像：          │          │ 用户画像：              │
+│ 长期记忆：空 │  ──────→ │ · 关注3个项目      │  ──────→ │ · 关注8个项目           │
+│           │          │ · 偏好简洁报告     │          │ · 偏好先看结论再看数据   │
+└──────────┘          │ · 常问利润数据     │          │ · 周一问周报，周五问预算 │
+                      │                  │          │ · 不喜欢图表只要文字     │
+                      │ 长期记忆：          │          │                        │
+                      │ · 5条对话洞察      │          │ 长期记忆：               │
+                      └──────────────┘          │ · 50+条对话洞察          │
+                                                │ · 跨会话关联分析         │
+                                                │ · 衰减淘汰过时信息        │
+                                                └──────────────────┘
+
+
+4.4 工具模块
+4.4.1 工具来源
+Agent 的工具来自两个渠道：
+
+┌─────────────────────────────────────────────────────────────────┐
+│                         Agent 可用工具                            │
+│                                                                  │
+│  ┌───────────────────────────┐  ┌───────────────────────────┐   │
+│  │  内置工具库（框架提供）       │  │  业务线 MCP 工具            │   │
+│  │                           │  │                           │   │
+│  │  框架级基础能力，无需业务线   │  │  业务线自建 MCP Server      │   │
+│  │  额外部署                  │  │  通过 MCP 协议接入          │   │
+│  │                           │  │                           │   │
+│  │  · createagent            │  │  · get_project_profit     │   │
+│  │    (动态创建子Agent)       │  │  · get_budget_status      │   │
+│  │  · cron                   │  │  · get_invoice_tax        │   │
+│  │    (定时任务调度)          │  │  · ...                    │   │
+│  │  · file_reader            │  │                           │   │
+│  │    (文件读取)             │  │  强制采用 MCP 规范          │   │
+│  │  · time_provider          │  │  Schema 启动时缓存         │   │
+│  │    (时间获取)             │  │  权限透传 (Auth)            │   │
+│  │                           │  │                           │   │
+│  └───────────────────────────┘  └───────────────────────────┘   │
+│                                                                  │
+│  在 scene.yaml 的 tool_bindings 中配置                                │
+└─────────────────────────────────────────────────────────────────┘
+
+4.4.2 内置工具库
+工具名	说明	用途
+createagent	动态创建子 Agent	运行时按需创建临时 Agent 处理特殊任务
+cron	定时任务调度	自行开发或对接 xxjob，支持定时执行 Skill
+file_reader	文件读取	读取配置文件、知识文件等
+time_provider	时间获取	提供当前时间、日期计算等
+4.4.3 业务线 MCP 接入
+强制采用 MCP (Model Context Protocol) 规范，框架作为 MCP Client：
+
+业务线部署 MCP Server
+    │
+    ▼
+在 mcp_servers.yaml 中注册 MCP Server 连接信息
+    │
+    ▼
+在 scene.yaml 的 tool_bindings 中绑定具体工具到 Agent
+    │
+    ▼
+框架启动时自动连接 MCP Server
+    │
+    ├── MCP Schema 缓存：从 MCP Server 抓取工具的 JSON Schema
+    │   并转换为 LangChain BaseTool，缓存到内存
+    │
+    ├── 权限透传 (Auth Transparent)：
+    │   · 凭证锁存：框架捕获请求头的 X-User-Token 或 Authorization
+    │   · 静默注入：发起 MCP 调用时，将用户凭证注入请求上下文
+    │   · 由业务侧 MCP Server 做 RBAC/ABAC 校验
+    │
+    └── 工具可用，Agent 可以调用
+
+4.4.4 MCP Schema 缓存机制
+MCP 工具的 Schema（名称、描述、参数定义）在启动时一次性获取并缓存，运行时只做实际的工具调用：
+
+┌─ 启动 / reload 时（低频）──────────────────────────────────────┐
+│                                                                  │
+│  遍历 mcp_servers.yaml 中所有 MCP Server                          │
+│      │                                                           │
+│      ▼                                                           │
+│  对每个 Server 调用 tools/list（MCP 协议标准方法）                   │
+│      │                                                           │
+│      ▼                                                           │
+│  获取完整的工具 Schema（名称、描述、参数 JSON Schema）                │
+│      │                                                           │
+│      ▼                                                           │
+│  转换为 LangChain BaseTool → 缓存到 MCPSchemaCache              │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─ 请求时（高频）──────────────────────────────────────────────────┐
+│                                                                  │
+│  Agent 组装时，从 MCPSchemaCache 获取工具定义（不再请求 MCP Server） │
+│      │                                                           │
+│      ▼                                                           │
+│  Agent 决定调用某个工具 → 通过 MCP 协议实际执行 tools/call           │
+│      │                                                           │
+│      ▼                                                           │
+│  MCP Server 执行业务逻辑 → 返回结果                                │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+
+好处：避免每次用户请求都去 MCP Server 查询工具列表，减少网络开销和延迟。
+认证透传流程：
+
+用户请求（携带 token）
+    │
+    ▼
+框架 Runtime → 创建 MCP Client 连接
+    │
+    │  连接时注入 HTTP Headers:
+    │    Authorization: Bearer {user_token}
+    │    X-User-Id: {user_id}
+    │
+    ▼
+MCP Server 从 HTTP Headers 读取认证信息
+    │
+    └── 调用业务后端接口时携带这些认证
+
+4.4.5 工具的调用方式
+●scene.yaml 中绑定的工具：Agent 组装时加载，全程可用
+●Skills 中需要用到的工具：临时调用方案——不能是工具，可能是一个脚本（见 4.5 Skills）
+
+4.5 Skills 模块
+4.5.1 Skill 定位
+Skill 是 Agent 的结构化复合能力，与 Tool 的区别：
+概念	本质	粒度	示例
+Tool	一个函数调用	原子操作	查项目利润、搜索实体
+Skill	结构化的执行能力	复合任务流程	项目健康诊断、异常扫描
+4.5.2 MD 语义注册
+业务线编写 Skill 的 MD 文档，框架将 MD 注册为 Agent 可调用的 Skill。
+Skill MD 文件结构：
+--- # ====== 头部（始终加载，注入系统提示作为索引） ====== name: "项目健康诊断" description: "对指定项目进行全方位健康诊断分析" path: "./skills/project_diagnosis.md"  # ====== 调用控制 ====== mode: tool                           # tool | script user_invocable: true                 # 用户可否手动 /项目诊断 触发 model_invocable: true                # LLM 可否自动触发 schedule: null                       # cron 表达式（非空时启用定时触发） argument_hint: "<项目ID>"  # ====== 依赖声明 ====== requires:   tools: [get_project_profit, get_operation_data] ---  # 执行指令（仅触发时加载）  你正在执行【项目健康诊断】任务。  ## 执行步骤 1. 调用 get_project_profit 获取项目财务数据 2. 调用 get_operation_data 获取运营数据 3. 综合分析，输出健康评分和关键发现  ## 输出格式 ...  ## 约束 - $ARGUMENTS 为项目ID，如果未提供则询问用户 4.5.3 两种执行模式
+模式	说明	适用场景
+工具模式 (tool)	Skill 作为 Prompt 注入，指导 Agent 调用已有工具完成任务	需要 Agent 推理和判断的复合任务
+脚本模式 (script)	框架在沙箱中运行 Python 脚本，直接执行逻辑	确定性流程，不需要 LLM 推理
+工具模式流程：
+
+触发 Skill
+    │
+    ▼
+加载 Skill 的 instruction（MD body）
+    │
+    ▼
+注入 Agent 上下文（作为 system message）
+    │
+    ▼
+Agent 按指令执行（调用 tools → 推理 → 输出）
+
+脚本模式流程：
+
+触发 Skill
+    │
+    ▼
+加载 Skill 关联的 Python 脚本
+    │
+    ▼
+框架在沙箱环境中运行脚本
+    │
+    ├── 脚本可以访问：工具调用接口、用户上下文、记忆
+    ├── 脚本不能：访问文件系统、网络（除白名单）、执行危险操作
+    │
+    ▼
+脚本返回结果，注入 Agent 上下文
+
+脚本模式示例：
+--- name: "数据导出" description: "将查询结果导出为格式化报表" mode: script script_path: "./scripts/export_report.py" --- 
+# scripts/export_report.py
+async def execute(context):
+    """Skill 脚本入口"""
+    project_id = context.arguments
+    # 调用工具获取数据
+    profit_data = await context.call_tool("get_project_profit", {"project_id": project_id})
+    # 数据处理（确定性逻辑，不需要 LLM）
+    report = format_report(profit_data)
+    return report
+
+4.5.4 Skill 注入策略
+系统提示只注入 Skill 的描述索引（头部信息），不预加载完整 instruction：
+
+System Prompt 中注入：
+
+<available_skills>
+    <skill>
+        <name>项目健康诊断</name>
+        <description>对指定项目进行全方位健康诊断分析</description>
+        <argument_hint>项目ID</argument_hint>
+    </skill>
+    <skill>
+        <name>异常项目扫描</name>
+        <description>扫描全部项目，识别异常并生成报告</description>
+    </skill>
+</available_skills>
+
+仅在触发时才加载完整 instruction，避免 token 浪费。
+4.5.5 触发方式
+方式	触发条件	指令加载	会话隔离
+手动触发	用户输入 /命令	框架直接加载注入	否（当前对话）
+自动触发	LLM 根据描述索引判断	LLM 调用 load_skill 工具	否（当前对话）
+定时触发	cron 表达式匹配	框架直接加载注入	是（独立会话）
+4.5.6 Skills 进化（自我进化能力之二）
+Skills 的进化是指系统越用越会做事：
+
+初始 Skills                    使用反馈后                    持续进化
+┌──────────────┐              ┌──────────────────┐         ┌─────────────────────┐
+│ · 项目诊断     │              │ · 项目诊断 v2       │         │ · 项目诊断 v5          │
+│ · 异常扫描     │  ──用户反馈→  │   (增加了成本维度)   │ ──────→ │   (精准匹配业务场景)    │
+│ · 月报生成     │              │ · 异常扫描 v2       │         │ · 新增：季度复盘       │
+│              │              │   (阈值更合理)      │         │ · 新增：竞品对比       │
+└──────────────┘              │ · 月报生成 v2       │         │ · 淘汰：低频Skill      │
+                              │   (格式更符合偏好)   │         └─────────────────────┘
+                              └──────────────────┘
+
+进化路径：
+1.用户使用中反馈"这个分析漏了XX维度"
+2.记忆系统记录反馈
+3.开发者（或 AI 辅助）更新 Skill MD 文件
+4.框架热加载新版本 Skill
+
+4.6 模型调用
+agent.md 中的 model 字段支持两种配置方式：
+
+# 方式一：模型名称字符串
+model: "deepseek-chat"
+
+# 方式二：详细配置
+model:
+  name: "deepseek-chat"
+  temperature: 0.6
+  max_tokens: 4096
+  timeout: 120
+
+每个 Agent（包括 SubAgent）可以独立配置模型，MainAgent 和 SubAgent 可以使用不同的模型。
+
+五、三方调用框架
+5.1 接入方式
+外部系统通过 WebSocket 或 HTTP 接入 Agent 基座：
+
+三方业务系统
+    │
+    ├── WebSocket（推荐，长连接，流式输出）
+    │   ws://host:port/ws
+    │
+    └── HTTP（简单场景）
+        POST http://host:port/api/chat
+
+5.2 入参规范
+WebSocket 连接：
+
+{
+  "action": "chat",
+  "data": {
+    "user_id": "unique_user_001",       // 必填：三方用户唯一ID
+    "message": "帮我看看华东区项目的利润情况",  // 必填：用户消息
+    "session_id": "sess_abc123",         // 可选：指定会话ID（不传则新建）
+    "agent_type": "bi-master"            // 可选：指定Agent类型（单Agent部署时可省略）
+  },
+  "headers": {
+    "Authorization": "Bearer xxx",       // 必填：用户token（透传给MCP Server）
+    "X-User-Id": "unique_user_001"       // 必填：用户唯一ID
+  }
+}
+
+5.3 出参规范
+流式输出事件：
+
+// 文字流
+{"action": "stream", "data": {"content": "华东区", "session_id": "sess_abc123"}}
+
+// 子Agent启动
+{"action": "subagent_start", "data": {"agent": "financial_manager", "task": "查询利润"}}
+
+// 工具调用开始
+{"action": "tool_start", "data": {"tool": "get_project_profit", "params": {...}}}
+
+// 工具调用结束
+{"action": "tool_end", "data": {"tool": "get_project_profit", "result": {...}}}
+
+// 子Agent结束
+{"action": "subagent_end", "data": {"agent": "financial_manager"}}
+
+// 完成
+{"action": "completed", "data": {"session_id": "sess_abc123"}}
+
+5.4 其他 Action
+
+// 取消当前请求
+{"action": "cancel", "data": {"session_id": "sess_abc123"}}
+
+// 心跳
+{"action": "ping"}
+
+// 查询状态
+{"action": "get_status", "data": {"session_id": "sess_abc123"}}
+
+5.5 三方用户唯一 ID
+●每个三方用户有一个唯一用户 ID（由三方系统生成和维护）
+●该 ID 是记忆系统隔离、会话管理、用户画像的唯一标识
+●框架不管理用户注册/登录，只接收并使用三方传入的用户 ID
+
+六、调试
+6.1 调试页面
+MVP 阶段需要一个调试页面，用于开发和测试 Agent：
+
+┌──────────────────────────────────────────────────────────────┐
+│                         调试页面                               │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐     │
+│  │  对话区域                                             │     │
+│  │                                                     │     │
+│  │  🤖 你好，我是永策Pro BI 智能体                        │     │
+│  │                                                     │     │
+│  │  👤 帮我看看华东区项目的利润情况                        │     │
+│  │                                                     │     │
+│  │  🤖 [调用 financial_manager SubAgent]                │     │
+│  │     [调用 get_project_profit 工具]                    │     │
+│  │     华东区项目利润情况如下...                           │     │
+│  └─────────────────────────────────────────────────────┘     │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐     │
+│  │  调试面板（核心需求：能看到具体的日志和调用内容）          │     │
+│  │                                                     │     │
+│  │  · 完整调用链路（MainAgent → SubAgent → Tool）        │     │
+│  │  · 每次工具调用的入参和出参                             │     │
+│  │  · LLM 推理过程（system prompt + 消息列表）            │     │
+│  │  · Token 消耗统计                                    │     │
+│  │  · Skill 触发记录                                    │     │
+│  │  · 记忆检索和注入内容                                  │     │
+│  │  · 错误日志和堆栈信息                                  │     │
+│  └─────────────────────────────────────────────────────┘     │
+│                                                              │
+│  访问地址: http://localhost:8000/yc-ai/debug                  │
+└──────────────────────────────────────────────────────────────┘
+
+6.2 日志要求
+调试页面需要展示的信息：
+信息类型	说明
+调用链路	MainAgent → SubAgent → Tool 的完整执行路径
+工具调用详情	每次 MCP 工具调用的参数和返回值
+LLM 交互	发送给 LLM 的完整消息列表（含 system prompt）和响应
+Token 消耗	每次 LLM 调用的 input/output token 数
+Skill 触发	哪个 Skill 被触发、触发方式、注入的 instruction
+记忆操作	记忆检索查询、返回结果、记忆提取和存储
+时间线	每个步骤的耗时
+错误信息	异常堆栈、工具调用失败原因
+
+七、存储
+暂不考虑，后续待定。
+MVP 阶段存储方案不做架构设计，先跑通核心流程。后续根据实际需求（数据量、性能要求、部署环境）再确定具体的数据库选型和存储架构。
+当前依赖：
+●PowerMem 自带的存储（记忆数据）
+●RAGFlow 自带的存储（知识库数据）
+●会话历史的存储方案待定
+
+八、生命周期架构
+8.1 纯文件方案生命周期
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Phase 1: 组件注册（启动时）                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  config/agents/*.md ──────────────────────────────────────────┐             │
+│      │                                                        │             │
+│      │  扫描目录                                               ▼             │
+│      │  解析 frontmatter                              ┌──────────────┐      │
+│      └─────────────────────────────────────────────→ │ AgentRegistry │      │
+│                                                       │              │      │
+│  config/skills/*.md ──────────────────────────────────│ SkillRegistry│      │
+│      │                                                │              │      │
+│      │  扫描目录                                       │ SceneRegistry│      │
+│      │  解析 frontmatter                              └──────────────┘      │
+│      └─────────────────────────────────────────────→        ▲              │
+│                                                             │              │
+│  config/scenes/*.yaml ──────────────────────────────────────┘              │
+│      │                                                                      │
+│      │  扫描目录                                                            │
+│      │  解析 YAML                                                          │
+│      └──────────────────────────────────────────────────────────────────→  │
+│                                                                             │
+│  config/mcp_servers.yaml ─────────────────────────────────────┐             │
+│      │                                                        │             │
+│      │  解析 YAML                                             ▼             │
+│      │  连接每个 MCP Server                           ┌──────────────┐      │
+│      │  调用 tools/list 获取 Schema                   │MCPSchemaCache│      │
+│      └─────────────────────────────────────────────→ └──────────────┘      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Phase 2: 请求处理                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  用户请求 (scene_id, user_id, message)                                       │
+│      │                                                                      │
+│      ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. 从 SceneRegistry 获取场景配置                                     │   │
+│  │  2. 从 AgentRegistry 获取 main_agent + sub_agents 定义               │   │
+│  │  3. 从 SkillRegistry 获取绑定的 Skill 定义                            │   │
+│  │  4. 从 MCPSchemaCache 获取绑定的 MCP 工具 Schema                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│      │                                                                      │
+│      ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  5. 动态组装 LangChain Agent                                          │   │
+│  │     · MainAgent: Prompt + 内置工具 + SubAgent-as-Tool                 │   │
+│  │     · SubAgent: Prompt + MCP工具 + Skills                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│      │                                                                      │
+│      ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  6. 执行 ReAct Loop                                                   │   │
+│  │     · LLM 推理 → 工具调用（MCP tools/call）→ 结果回传 → 继续推理        │   │
+│  │     · 需要 SubAgent → Sync-Orchestrator 阻塞调度                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│      │                                                                      │
+│      ▼                                                                      │
+│  流式输出 → 记忆提取 → 会话持久化                                             │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Phase 3: 热更新                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  开发者编辑配置文件                                                           │
+│      │                                                                      │
+│      ▼                                                                      │
+│  POST /api/reload                                                           │
+│      │                                                                      │
+│      ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. 重新扫描 config/ 目录                                             │   │
+│  │  2. 解析所有配置文件                                                   │   │
+│  │  3. 重新连接 MCP Server 获取最新 Schema                               │   │
+│  │  4. 更新内存中的 Registry 和 Cache                                    │   │
+│  │  5. 下次请求使用新配置                                                 │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+8.2 Page + 数据库方案生命周期
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Phase 1: 组件注册（通过管理页面）                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌──────────────┐                      ┌──────────────────────────────┐    │
+│  │  管理页面      │                      │          数据库               │    │
+│  │              │                      │                              │    │
+│  │  Agent 管理   │ ─── CRUD API ──────→ │  agents 表                   │    │
+│  │  · 名称/描述  │                      │  · id, name, description     │    │
+│  │  · Prompt    │                      │  · model_config, prompt      │    │
+│  │  · 模型配置   │                      │                              │    │
+│  │              │                      │                              │    │
+│  │  Skill 管理  │ ─── CRUD API ──────→ │  skills 表                   │    │
+│  │  · 名称/描述  │                      │  · id, name, description     │    │
+│  │  · 执行指令   │                      │  · mode, instruction         │    │
+│  │              │                      │                              │    │
+│  │  MCP 配置    │ ─── CRUD API ──────→ │  mcp_servers 表              │    │
+│  │  · Server URL│                      │  · id, url, auth_mode        │    │
+│  │  · 刷新Schema│ ─── /refresh ──────→ │  tools 表 (Schema缓存)        │    │
+│  │              │                      │  · server_id, name, schema   │    │
+│  │              │                      │                              │    │
+│  │  Scene 编排  │ ─── CRUD API ──────→ │  scenes 表                   │    │
+│  │  · 主Agent   │                      │  · id, name, main_agent_id   │    │
+│  │  · 子Agent   │                      │  scene_sub_agents 表         │    │
+│  │  · 工具绑定  │                      │  agent_tool_bindings 表      │    │
+│  │  · 技能绑定  │                      │  agent_skill_bindings 表     │    │
+│  └──────────────┘                      └──────────────────────────────┘    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Phase 2: 请求处理                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  用户请求 (scene_id, user_id, message)                                       │
+│      │                                                                      │
+│      ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. 从 DB 查询 scenes 表获取场景配置                                   │   │
+│  │  2. 从 DB 查询 agents 表获取 main_agent + sub_agents 定义             │   │
+│  │  3. 从 DB 查询 skills 表获取绑定的 Skill 定义                          │   │
+│  │  4. 从 DB 查询 tools 表获取绑定的 MCP 工具 Schema                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│      │                                                                      │
+│      ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  5. 动态组装 LangChain Agent（与纯文件方案相同）                        │   │
+│  │  6. 执行 ReAct Loop（与纯文件方案相同）                                │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│      │                                                                      │
+│      ▼                                                                      │
+│  流式输出 → 记忆提取 → 会话持久化                                             │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Phase 3: 热更新                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  管理员在页面修改配置                                                         │
+│      │                                                                      │
+│      ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. 调用 CRUD API 更新数据库                                          │   │
+│  │  2. 下次请求时从 DB 读取最新配置                                       │   │
+│  │  3. 自动生效，无需重启或手动 reload                                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  MCP Server 工具变更                                                         │
+│      │                                                                      │
+│      ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. 在管理页面点击"刷新 Schema"                                        │   │
+│  │  2. 调用 POST /api/mcp-servers/{id}/refresh                          │   │
+│  │  3. 重新连接 MCP Server 获取最新 tools/list                           │   │
+│  │  4. 更新 tools 表中的 Schema 缓存                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+8.3 两种方案的演进路径
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│   MVP 阶段                      中期                        长期             │
+│                                                                             │
+│   ┌──────────────┐         ┌──────────────┐         ┌──────────────┐       │
+│   │  纯文件方案    │         │  混合方案      │         │  Page+DB方案  │       │
+│   │              │         │              │         │              │       │
+│   │  · MD/YAML   │ ──────→ │  · 文件为主    │ ──────→ │  · DB 为主    │       │
+│   │  · 内存缓存   │         │  · DB 辅助    │         │  · 管理页面   │       │
+│   │  · reload API│         │  · 简单页面    │         │  · 版本管理   │       │
+│   │              │         │              │         │  · 权限控制   │       │
+│   └──────────────┘         └──────────────┘         └──────────────┘       │
+│                                                                             │
+│   开发工作量：~2周            开发工作量：~4周            开发工作量：~6周       │
+│                                                                             │
+│   适用场景：                  适用场景：                  适用场景：            │
+│   · 开发调试                 · 小规模生产               · 多人协作            │
+│   · 单人维护                 · 需要简单管理             · 企业级部署          │
+│   · 快速迭代                                           · 审计合规            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+九、MVP 范围边界
+9.1 MVP 内（必须做）
+模块	范围
+配置规范	agent.md 定义 + skill.md 定义 + scene.yaml 编排 + mcp_servers.yaml 注册
+配置解析	启动时扫描 config/ 目录，解析所有配置文件，构建内存 Registry
+Agent 执行	基于 Scene 配置动态组装 Agent，MainAgent + SubAgent 多级编排
+Sync-Orchestrator	同步调度代理，阻塞等待，主从隔离记忆
+记忆系统	Session 短期记忆 + PowerMem 长期记忆 + 上下文压缩 + 用户画像
+内置工具库	createagent、cron（自行开发或对接 xxjob）、file_reader、time_provider
+MCP 工具接入	MCP Client Hub，连接业务线 MCP Server，Schema 缓存，认证透传
+Skills	MD 语义注册，工具模式 + 脚本模式（沙箱），手动/自动/定时三种触发
+知识	MD 文件内联知识 + RAGFlow 知识库
+三方调用	WebSocket/HTTP 接入，用户唯一ID，入参出参规范
+调试	调试页面，展示日志、调用链路、工具调用详情
+并发	同一 Agent 多实例独立会话
+热更新	POST /api/reload 触发配置重新加载
+9.2 MVP 外（后续迭代）
+模块	说明
+前端管理页面	可视化 Agent 编排、Skill 编辑、Scene 配置（Page + DB 方案）
+数据库存储	配置持久化到数据库，支持版本管理
+发布管理	draft → publish 版本流转
+Hook 机制	生命周期事件拦截（Rule/Webhook/Prompt）
+安全控制	三层防御（输入/运行时/输出），MVP 阶段做基本防护即可
+模型路由	动态路由、A/B 测试、Fallback
+自进化审批流	Agent 提交进化记录 → 人工审批 → AI 辅助修改
+监控审计	用量统计、操作审计、告警通知
+9.3 关键里程碑
+
+Phase 1: 跑通核心链路
+  · 配置规范定义（agent.md + skill.md + scene.yaml）
+  · 配置解析 → Registry 构建 → Agent 组装 → 对话可用
+  · 内置工具可调用
+  · 调试页面可用
+
+Phase 2: 外部工具 + 多Agent
+  · MCP Client Hub 连接业务线 MCP Server
+  · MCP Schema 缓存机制
+  · MainAgent → SubAgent 调度（Sync-Orchestrator）
+  · 主从隔离记忆
+
+Phase 3: 记忆 + 知识 + Skills
+  · PowerMem 集成（短期/长期记忆）
+  · RAGFlow 知识库接入
+  · Skills MD 语义注册 + 双模式执行
+
+Phase 4: 完善 + 并发
+  · 三方调用框架完善
+  · 并发多实例支持
+  · 定时任务（cron）
+  · 热更新 API（/api/reload）
+
+
+十、与前期调研文档的关系
+前期文档	与 MVP 的关系
+docs/1. BI-Agent 演进方向概述	属于永策Pro业务线的具体方案，非基座框架范围。其中"主动雷达"的理念可通过 Skill 定时触发实现
+docs/2. 热启动与档案系统设计	属于永策Pro业务线的数据中间层方案。基座通过 RAGFlow 知识库 + MD 知识文件提供通用能力
+docs/3. workflow-guide	AI 辅助开发流程指南，继续沿用
+docs/4. AI辅助开发工作流	开发流程评估，继续沿用
+docs/5. 持久记忆方案调研	技术选型已确定为 PowerMem，调研结论作为参考保留
+docs/6. MCP工具服务化方案	MCP 方案沿用，但从"平台统一注册"改为"agent.md 中配置"
+docs/7. OpenClaw源码分析	Skill 系统、记忆系统的设计参考仍然有效，多租户相关对比已不适用
+docs/8. 企业级Agent基座平台架构设计	已废弃。核心定位（多租户SaaS）与会议决策冲突。其中的 Skill 设计、记忆设计、MCP 设计等模块的技术细节仍可参考
+
